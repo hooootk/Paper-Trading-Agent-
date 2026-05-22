@@ -32,7 +32,7 @@ warnings.filterwarnings("ignore")
 # ── Azure OpenAI ──────────────────────────────────────────────────────
 AZURE_OPENAI_ENDPOINT = ""
 AZURE_OPENAI_API_KEY = ""
-AZURE_OPENAI_API_VERSION = ""
+AZURE_OPENAI_API_VERSION = "2025-02-01-preview"
 AZURE_OPENAI_DEPLOYMENT = "gpt-4o"
 
 # ── Alpaca Paper Trading ──────────────────────────────────────────────
@@ -539,14 +539,17 @@ Output strictly as JSON:
 
 try:
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest
+    from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, StopOrderRequest, GetOrdersRequest
     from alpaca.trading.enums import OrderSide, TimeInForce
     ALPACA_AVAILABLE = True
     try:
         from alpaca.trading.enums import OrderClass
+        from alpaca.trading.requests import TakeProfitRequest, StopLossRequest
         BRACKET_SUPPORT = True
     except ImportError:
         OrderClass = None  # type: ignore
+        TakeProfitRequest = None  # type: ignore
+        StopLossRequest = None  # type: ignore
         BRACKET_SUPPORT = False
 except ImportError:
     ALPACA_AVAILABLE = False
@@ -598,19 +601,28 @@ class AlpacaExecutor:
                   sl_pct: float = STOP_LOSS_PCT) -> list:
         """
         Align the paper portfolio to target_weights.
+        Buying power is respected: buy quantities are scaled down if needed.
         If use_bracket=True, BUY orders use bracket orders with TP/SL attached.
         Returns list of tickers submitted.
         """
         account = self.client.get_account()
         equity = float(account.equity)
+        buying_power = float(account.buying_power)
+        cash = float(account.cash)
         positions = {p.symbol: float(p.qty) for p in self.client.get_all_positions()}
 
         tickers = list(target_weights.keys())
         prices = yf.download(tickers, period="2d", progress=False)["Close"].iloc[-1].to_dict()
 
         order_label = "bracket" if use_bracket else "market"
-        print(f"\n── Rebalancing (equity=${equity:,.2f}, dry_run={dry_run}, {order_label}) ──")
-        submitted = []
+        print(f"\n── Rebalancing (equity=${equity:,.2f}, buying_power=${buying_power:,.2f}, "
+              f"dry_run={dry_run}, {order_label}) ──")
+
+        # ── Pass 1: calculate buy/sell amounts ──
+        sells = []   # list of (ticker, qty, price, cost)
+        buys = []    # list of (ticker, qty, price, cost)
+        total_sell_proceeds = 0.0
+
         for ticker, weight in target_weights.items():
             if ticker not in prices or np.isnan(prices[ticker]):
                 print(f"  {ticker}  no price → skip")
@@ -622,28 +634,96 @@ class AlpacaExecutor:
             if delta == 0:
                 print(f"  {ticker:<6}  no change  (qty={current_qty})")
                 continue
-            side = "buy" if delta > 0 else "sell"
-            qty = abs(delta)
-            tp_str = f" TP={tp_pct*100:.0f}%" if (use_bracket and side == "buy") else ""
-            sl_str = f" SL={sl_pct*100:.0f}%" if (use_bracket and side == "buy") else ""
-            print(f"  {ticker:<6}  {side.upper()} {qty:>4} @ ~${price:.2f}"
-                  f"  (target={target_qty}, cur={current_qty}){tp_str}{sl_str}")
-            if not dry_run:
+            if delta > 0:
+                buys.append((ticker, delta, price, delta * price))
+            else:
+                qty = abs(delta)
+                sells.append((ticker, qty, price, qty * price))
+                total_sell_proceeds += qty * price
+
+        submitted = []
+
+        if dry_run:
+            for ticker, qty, price, cost in sells:
+                print(f"  {ticker:<6}  SELL {qty:>4} @ ~${price:.2f}  ≈${cost:,.2f}")
+            for ticker, qty, price, cost in buys:
+                tp_str = f" TP={tp_pct*100:.0f}%" if use_bracket else ""
+                sl_str = f" SL={sl_pct*100:.0f}%" if use_bracket else ""
+                print(f"  {ticker:<6}  BUY {qty:>4} @ ~${price:.2f}  ≈${cost:,.2f}{tp_str}{sl_str}")
+            print(f"  → Dry run (no orders).")
+            return submitted
+
+        # ── Pass 2: submit SELLS first ─────────────────────────────────
+        if sells:
+            print(f"  ── Submitting {len(sells)} sell(s) ──")
+        for ticker, qty, price, cost in sells:
+            print(f"  {ticker:<6}  SELL {qty:>4} @ ~${price:.2f}  ≈${cost:,.2f}")
+            try:
+                existing = self.client.get_orders(
+                    GetOrdersRequest(status="open", symbols=[ticker], limit=50)
+                )
+                for o in existing:
+                    self.client.cancel_order_by_id(str(o.id))
+                    print(f"    Cancelled open order {o.id} for {ticker}")
+                if existing:
+                    time.sleep(0.3)
+                order = MarketOrderRequest(
+                    symbol=ticker, qty=qty, side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                )
+                self.client.submit_order(order)
+                submitted.append(ticker)
+            except Exception as e:
+                print(f"    Sell order failed: {e}")
+
+        # ── Pass 3: wait for sells, then submit BUYS with fresh buying power ──
+        if buys:
+            if sells:
+                print(f"  Waiting 3s for sells to settle ...")
+                time.sleep(3)
+                account = self.client.get_account()
+                buying_power = float(account.buying_power)
+                print(f"  ── Submitting {len(buys)} buy(s) (buying_power=${buying_power:,.2f}) ──")
+            else:
+                print(f"  ── Submitting {len(buys)} buy(s) (buying_power=${buying_power:,.2f}) ──")
+
+            # Sort buys largest cost first so small buys don't drain the budget early
+            buys.sort(key=lambda x: -x[3])
+
+            # Track remaining buying power as we submit
+            remaining_bp = buying_power
+
+            for ticker, qty, price, cost in buys:
+                # Scale this individual buy to fit remaining buying power
+                scaled = False
+                if cost > remaining_bp:
+                    new_qty = int(remaining_bp / price) if price > 0 else 0
+                    if new_qty <= 0:
+                        print(f"  {ticker:<6}  BUY   skip — ${cost:,.2f} > remaining ${remaining_bp:,.2f}")
+                        continue
+                    qty = new_qty
+                    cost = qty * price
+                    scaled = True
+
+                tp_str = f" TP={tp_pct*100:.0f}%" if use_bracket else ""
+                sl_str = f" SL={sl_pct*100:.0f}%" if use_bracket else ""
+                note = " (scaled to fit BP)" if scaled else ""
+                print(f"  {ticker:<6}  BUY {qty:>4} @ ~${price:.2f}  ≈${cost:,.2f}{tp_str}{sl_str}{note}")
                 try:
-                    if use_bracket and side == "buy" and qty > 0:
+                    if use_bracket and qty > 0:
                         self._submit_bracket_order(ticker, qty, price, tp_pct, sl_pct)
                     else:
                         order = MarketOrderRequest(
-                            symbol=ticker,
-                            qty=qty,
-                            side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+                            symbol=ticker, qty=qty, side=OrderSide.BUY,
                             time_in_force=TimeInForce.DAY,
                         )
                         self.client.submit_order(order)
                     submitted.append(ticker)
+                    remaining_bp -= cost
                 except Exception as e:
-                    print(f"    Order failed: {e}")
-        print(f"  → {'Dry run (no orders).' if dry_run else f'{len(submitted)} order(s) submitted.'}")
+                    print(f"    Buy order failed: {e}")
+
+        print(f"  → {len(submitted)} order(s) submitted.")
         return submitted
 
     def _submit_bracket_order(self, ticker: str, qty: int, price: float,
@@ -654,13 +734,11 @@ class AlpacaExecutor:
         sl_price = round(price * (1 - sl_pct), 2)
 
         if BRACKET_SUPPORT:
-            take_profit = LimitOrderRequest(
-                symbol=ticker, qty=qty, side=OrderSide.SELL,
-                limit_price=tp_price, time_in_force=TimeInForce.GTC,
+            take_profit = TakeProfitRequest(
+                limit_price=tp_price,
             )
-            stop_loss = StopOrderRequest(
-                symbol=ticker, qty=qty, side=OrderSide.SELL,
-                stop_price=sl_price, time_in_force=TimeInForce.GTC,
+            stop_loss = StopLossRequest(
+                stop_price=sl_price,
             )
             bracket_order = MarketOrderRequest(
                 symbol=ticker, qty=qty, side=OrderSide.BUY,
@@ -718,13 +796,15 @@ class AlpacaExecutor:
                   f"TP=${tp_price:.2f} ({tp_pct*100:.0f}%)  SL=${sl_price:.2f} ({sl_pct*100:.0f}%)")
             if not dry_run:
                 try:
-                    # Cancel existing open orders for this symbol
+                    # Cancel existing open orders for this symbol first
                     existing = self.client.get_orders(
-                        status="open", symbols=[sym], limit=50
+                        GetOrdersRequest(status="open", symbols=[sym], limit=50)
                     )
                     for o in existing:
                         self.client.cancel_order_by_id(str(o.id))
-                        print(f"    Cancelled existing: {o.id}")
+                        print(f"    Cancelled existing order: {o.id}")
+                    if existing:
+                        time.sleep(0.3)  # let cancellations settle
                     tp_order = LimitOrderRequest(
                         symbol=sym, qty=qty, side=OrderSide.SELL,
                         limit_price=tp_price, time_in_force=TimeInForce.GTC,
@@ -735,7 +815,7 @@ class AlpacaExecutor:
                     )
                     self.client.submit_order(tp_order)
                     self.client.submit_order(sl_order)
-                    print(f"    TP+SL submitted (OCO pair)")
+                    print(f"    TP+SL submitted")
                     attached.append(sym)
                 except Exception as e:
                     print(f"    Failed: {e}")
@@ -1299,6 +1379,159 @@ class TradingAgent:
               f" — strategies: {rec}")
         return self.trigger_backtest(indices)
 
+    # ── best-strategy selection ───────────────────────────────────────
+
+    def select_best_strategy(self, config_path: str = "",
+                             verbose: bool = True) -> dict:
+        """Backtest all strategies and select the best by composite metric ranking.
+
+        Ranks strategies on 6 metrics (Sharpe, Calmar, Sortino, Profit Factor,
+        Max Drawdown, Win Rate), then picks the one with the best average rank.
+
+        Args:
+            config_path: path to strategy_config.json (default: auto-detect).
+            verbose: print detailed comparison and ranking.
+
+        Returns:
+            {index, name, metrics, score, strategy_config, ...}
+        """
+        results = self.trigger_backtest(config_path=config_path, verbose=verbose)
+        if not results:
+            raise ValueError("No valid backtest results. Check strategy config.")
+
+        n = len(results)
+
+        # ── single strategy → no ranking needed ──
+        if n == 1:
+            strategies = StrategyConfig.load(config_path) if config_path else StrategyConfig.load()
+            idx = next((i for i, s in enumerate(strategies) if s["name"] == results[0]["name"]), 0)
+            print(f"\n  Only 1 strategy available → auto-selected: {results[0]['name']}")
+            return {
+                "index": idx,
+                "name": results[0]["name"],
+                "metrics": results[0]["metrics"],
+                "score": 1.0,
+                "strategy_config": strategies[idx],
+            }
+
+        # ── multi-metric ranking ──
+        ranking_metrics = [
+            ("sharpe_ratio", True),       # higher is better
+            ("calmar_ratio", True),
+            ("sortino_ratio", True),
+            ("profit_factor", True),
+            ("max_drawdown_pct", False),  # lower is better
+            ("win_rate_pct", True),
+        ]
+
+        ranks = {i: [] for i in range(n)}
+
+        for metric, higher_better in ranking_metrics:
+            values = []
+            for r in results:
+                v = r["metrics"].get(metric)
+                if not isinstance(v, (int, float)) or v == float("inf") or v == float("-inf"):
+                    v = float("-inf") if higher_better else float("inf")
+                values.append(v)
+            sorted_idx = sorted(range(n), key=lambda i: values[i], reverse=higher_better)
+            for rank, idx in enumerate(sorted_idx):
+                ranks[idx].append(rank + 1)
+
+        avg_ranks = {i: np.mean(r) for i, r in ranks.items()}
+        best_idx = int(min(avg_ranks, key=avg_ranks.get))
+
+        # Composite score [0, 1]: invert the average rank
+        max_r = max(avg_ranks.values())
+        min_r = min(avg_ranks.values())
+        score = 1.0 if max_r == min_r else round(1.0 - (avg_ranks[best_idx] - min_r) / (max_r - min_r), 3)
+
+        strategies = StrategyConfig.load(config_path) if config_path else StrategyConfig.load()
+        best_name = results[best_idx]["name"]
+        config_idx = next((i for i, s in enumerate(strategies) if s["name"] == best_name), best_idx)
+
+        if verbose:
+            print(f"\n{'='*70}")
+            print(f"  BEST STRATEGY RANKING (lower avg rank = better)")
+            print(f"{'='*70}")
+            print(f"  {'Rank':<6} {'Strategy':<22} {'AvgRank':>9} {'Score':>7} "
+                  f"{'Sharpe':>8} {'Calmar':>8} {'MaxDD%':>8} {'PF':>7} {'Win%':>7}")
+            print(f"  {'─'*6} {'─'*22} {'─'*9} {'─'*7} {'─'*8} {'─'*8} {'─'*8} {'─'*7} {'─'*7}")
+            sorted_by_rank = sorted(avg_ranks.items(), key=lambda x: x[1])
+            for rank_pos, (idx, avg_r) in enumerate(sorted_by_rank):
+                r = results[idx]
+                m = r["metrics"]
+                marker = " ★" if idx == best_idx else "  "
+                pf = m["profit_factor"]
+                pf_str = f"{pf:.2f}" if isinstance(pf, (int, float)) else str(pf)
+                s = 1.0 if max_r == min_r else round(1.0 - (avg_r - min_r) / (max_r - min_r), 3)
+                print(f"  {rank_pos+1:<6} {r['name']:<22} {avg_r:>8.3f} {s:>6.3f}{marker} "
+                      f"{m['sharpe_ratio']:>8.3f} {m['calmar_ratio']:>8.3f} "
+                      f"{m['max_drawdown_pct']:>7.2f}% {pf_str:>7} "
+                      f"{m['win_rate_pct']:>6.2f}%")
+            print(f"\n  ★ Selected: {results[best_idx]['name']} (score={score}, "
+                  f"Sharpe={results[best_idx]['metrics']['sharpe_ratio']})")
+
+        return {
+            "index": config_idx,
+            "name": best_name,
+            "metrics": results[best_idx]["metrics"],
+            "score": score,
+            "strategy_config": strategies[config_idx],
+        }
+
+    def auto_select_and_trade(self, target_date: str = "",
+                              dry_run: bool = True,
+                              use_bracket: bool = False) -> dict:
+        """Full auto pipeline: backtest all → select best → paper trade.
+
+        Args:
+            target_date: trading date YYYY-MM-DD (default: today).
+            dry_run: if True, skip order submission.
+            use_bracket: if True, use bracket orders with TP/SL for buys.
+
+        Returns:
+            target_weights dict from the winning strategy.
+        """
+        target_date = target_date or datetime.today().strftime("%Y-%m-%d")
+
+        print(f"\n{'='*60}")
+        print(f"  AUTO-SELECT BEST STRATEGY & TRADE")
+        print(f"  {target_date}")
+        print(f"{'='*60}")
+
+        # Phase 1: Backtest all & select best
+        print(f"\n  ╔{'═'*58}╗")
+        print(f"  ║  PHASE 1: BACKTEST ALL STRATEGIES".ljust(61) + "║")
+        print(f"  ╚{'═'*58}╝")
+        best = self.select_best_strategy(verbose=True)
+
+        # Phase 2: Trade with best strategy
+        print(f"\n  ╔{'═'*58}╗")
+        print(f"  ║  PHASE 2: TRADE WITH BEST STRATEGY".ljust(61) + "║")
+        print(f"  ╚{'═'*58}╝")
+        print(f"  Best strategy : {best['name']} (score={best['score']})")
+        print(f"  Factors       : {len(best['strategy_config'].get('factors', {}))}")
+        print(f"  Tickers       : {', '.join(best['strategy_config']['tickers'][:8])}"
+              f"{'...' if len(best['strategy_config'].get('tickers', [])) > 8 else ''}")
+        print(f"  Order mode    : {'dry run' if dry_run else 'REAL ORDERS'}")
+        if use_bracket:
+            print(f"  TP/SL         : enabled (TP={TAKE_PROFIT_PCT*100:.0f}%, SL={STOP_LOSS_PCT*100:.0f}%)")
+
+        weights = self.run_with_strategy(
+            best["index"], target_date=target_date, dry_run=dry_run
+        )
+        self.report()
+
+        print(f"\n  ╔{'═'*58}╗")
+        print(f"  ║  AUTO-SELECT COMPLETE".ljust(61) + "║")
+        print(f"  ╚{'═'*58}╝")
+        print(f"  Traded with : {best['name']}")
+        print(f"  Score       : {best['score']}")
+        print(f"  Sharpe      : {best['metrics']['sharpe_ratio']}")
+        print(f"  MaxDD       : {best['metrics']['max_drawdown_pct']}%")
+
+        return weights
+
     # ── multi-strategy parallel trading ──────────────────────────────
 
     def run_multi_strategies(self, strategy_indices: list[int],
@@ -1338,17 +1571,21 @@ class TradingAgent:
 
         target_date = target_date or datetime.today().strftime("%Y-%m-%d")
 
-        print(f"\n{'='*60}")
-        print(f"  MULTI-STRATEGY PARALLEL TRADING")
-        print(f"  {n} strategies | {target_date}")
-        print(f"{'='*60}")
-
+        print(f"\n╔{'═'*62}╗")
+        print(f"║  MULTI-STRATEGY PARALLEL TRADING".ljust(64) + "║")
+        print(f"║  {n} strategies | {target_date} | "
+              f"Capital: ${INITIAL_CAPITAL:,}".ljust(64) + "║")
+        print(f"╠{'═'*62}╣")
         for i, idx in enumerate(strategy_indices):
             s = strategies[idx]
-            print(f"  [{i}] #{idx} {s['name']} — "
-                  f"{len(s.get('factors',{}))} factors, "
-                  f"{len(s.get('tickers',[]))} tickers, "
-                  f"capital={capital_weights[i]*100:.0f}%")
+            name = s['name']
+            n_factors = len(s.get('factors', {}))
+            n_tickers = len(s.get('tickers', []))
+            cap = capital_weights[i] * 100
+            cap_bar = "█" * int(cap / 5)
+            print(f"║  [{i}] #{idx} {name:<22}  {n_factors:>2}f {n_tickers:>2}t  "
+                  f"│ {cap:>5.1f}% {cap_bar}".ljust(64) + "║")
+        print(f"╚{'═'*62}╝")
 
         # Step 1 — Fetch all data (union of all tickers across strategies)
         all_tickers = set()
@@ -1365,15 +1602,34 @@ class TradingAgent:
         hist = self.raw_data[self.raw_data.index < end_dt].copy()
 
         # Step 2 — Run each strategy independently to get target weights
+        print(f"\n  ╔{'═'*58}╗")
+        print(f"  ║  RUNNING {n} STRATEGIES IN PARALLEL".ljust(61) + "║")
+        print(f"  ╚{'═'*58}╝")
         all_strategy_weights: list[dict[str, float]] = []
+        all_strategy_names: list[str] = []
         for i, idx in enumerate(strategy_indices):
             s = strategies[idx]
             strategy_tickers = [t for t in s["tickers"] if t in hist.columns]
-            print(f"\n  ── [{i}] {s['name']} ──")
+            strategy_name = s['name']
+            all_strategy_names.append(strategy_name)
             ticker_prices = hist[strategy_tickers]
             benchmark = hist["SPY"] if "SPY" in hist.columns else hist.iloc[:, 0]
 
+            print(f"\n  ┌── STRATEGY [{i}] : {strategy_name} ".ljust(61) + "┐")
+            print(f"  │  Capital: {capital_weights[i]*100:.0f}% | "
+                  f"Factors: {', '.join(list(s.get('factors',{}).keys())[:5])}"
+                  f"{'...' if len(s.get('factors',{})) > 5 else ''}".ljust(43)[:43] + " │")
+
             signals = self._compute_strategy_signals(s, ticker_prices, benchmark)
+
+            # Show per-ticker signal scores for this strategy
+            if signals:
+                sorted_sigs = sorted(signals.items(), key=lambda x: -x[1])
+                print(f"  │  Ticker signals:                                    │")
+                for t, score in sorted_sigs[:6]:
+                    bar = "█" * max(1, int(abs(score) * 10))
+                    direction = "+" if score > 0 else " "
+                    print(f"  │    {t:<6} {direction}{score:+.3f} {bar} │")
 
             # Temporarily set self.tickers for _strategy_weights to use
             saved_tickers = self.tickers
@@ -1383,6 +1639,17 @@ class TradingAgent:
             self.tickers = saved_tickers
             all_strategy_weights.append(w)
 
+            # Show individual strategy weights
+            active_positions = {t: wt for t, wt in w.items() if wt > 0.01}
+            if active_positions:
+                print(f"  │  Target weights ({len(active_positions)} positions):                 │")
+                for t, wt in sorted(active_positions.items(), key=lambda x: -x[1]):
+                    wbar = "█" * int(wt * 20)
+                    print(f"  │    {t:<6} {wt*100:5.1f}% {wbar} │")
+            else:
+                print(f"  │  (defensive: equal-weight all tickers)             │")
+            print(f"  └{'─'*58}┘")
+
         # Step 3 — Merge weights: capital-weighted average across strategies
         combined_weights: dict[str, float] = {}
         all_tickers_in_use = set()
@@ -1390,10 +1657,15 @@ class TradingAgent:
             all_tickers_in_use.update(w.keys())
         all_tickers_in_use = sorted(all_tickers_in_use)
 
+        # Build contribution matrix: contribution[i][ticker] = weight * capital_weight
+        contribution: dict[str, dict[str, float]] = {}  # ticker → {strategy_name: contribution}
         for ticker in all_tickers_in_use:
+            contribution[ticker] = {}
             combined = 0.0
             for i, w in enumerate(all_strategy_weights):
-                combined += w.get(ticker, 0.0) * capital_weights[i]
+                contrib = w.get(ticker, 0.0) * capital_weights[i]
+                contribution[ticker][all_strategy_names[i]] = contrib
+                combined += contrib
             combined_weights[ticker] = combined
 
         # Renormalize
@@ -1403,7 +1675,35 @@ class TradingAgent:
 
         self.target_weights = combined_weights
 
-        print(f"\n  ── Combined Target Weights ──")
+        # ── Visual contribution breakdown ──
+        print(f"\n  ╔{'═'*58}╗")
+        print(f"  ║  WEIGHT CONTRIBUTION BREAKDOWN".ljust(61) + "║")
+        print(f"  ╠{'═'*58}╣")
+        # Header
+        header = f"  ║ {'Ticker':<7}"
+        for name in all_strategy_names:
+            header += f"{name[:12]:>12} "
+        header += f"{'Combined':>10} ║"
+        print(header)
+        print(f"  ║{'─'*57}║")
+        # Rows
+        for ticker, tw in sorted(combined_weights.items(), key=lambda x: -x[1]):
+            if tw < 0.01:
+                continue
+            row = f"  ║ {ticker:<7}"
+            for name in all_strategy_names:
+                c = contribution[ticker].get(name, 0.0) * 100
+                row += f"{c:>10.1f}% "
+            row += f"{'→':>2} {tw*100:>5.1f}% ║"
+            print(row)
+        # Footer: strategy total bar
+        print(f"  ║{'─'*57}║")
+        for i, name in enumerate(all_strategy_names):
+            total_strat = sum(contribution.get(t, {}).get(name, 0.0) for t in all_tickers_in_use) * 100
+            print(f"  ║  {name}: allocation contribution = {total_strat:.1f}% of portfolio".ljust(61) + "║")
+        print(f"  ╚{'═'*58}╝")
+
+        print(f"\n  ── Final Combined Weights ──")
         for t, w in sorted(combined_weights.items(), key=lambda x: -x[1]):
             if w > 0.01:
                 bar = "█" * int(w * 50)
@@ -1472,6 +1772,115 @@ class TradingAgent:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# INTENT RECOGNITION — natural language → menu option mapping
+# ═══════════════════════════════════════════════════════════════════════
+
+INTENT_RECOGNITION_SYSTEM = (
+    "You are an intent classifier for a paper trading system. "
+    "Always return valid JSON only."
+)
+
+INTENT_RECOGNITION_TEMPLATE = """
+You are an intent classifier for a Paper Trading Agent system.
+
+Available functions (with their option numbers):
+
+[1] LLM Multi-Agent Trading (Dry Run) — Run the full LLM pipeline (Macro → StockAnalyst → RiskManager) and compute target weights, but do NOT submit orders. Keywords: AI分析, LLM分析, 模拟分析, 多智能体分析, dry run, analyze with AI, paper analysis, 看看AI怎么说, 用AI分析一下行情, 试算, 分析一下
+
+[2] LLM Multi-Agent Trading (Real Orders) — Run the full LLM pipeline AND submit real orders to Alpaca paper account. Keywords: AI下单, LLM交易, 多智能体交易, real orders, AI trade, execute with AI, 让AI交易, 用AI实盘, AI实盘交易
+
+[3] Strategy-Based Trading (Dry Run) — Run a single rule-based strategy from strategy_config.json without submitting orders. Keywords: 策略模拟, 策略试算, 因子策略, rule-based dry run, 用策略分析, 跑因子, 因子分析
+
+[4] Strategy-Based Trading (Real Orders) — Run a single rule-based strategy AND submit real orders. Keywords: 策略下单, 因子实盘, 策略实盘交易, rule-based real orders, execute strategy, 用策略交易
+
+[5] Backtest All Strategies — Run backtesting on ALL strategies and show performance comparison. Keywords: 回测所有, 全部回测, 回测全部策略, backtest all, run all backtests, 跑回测, 回测一下, 回测
+
+[6] Backtest Single Strategy — Run backtesting on ONE specific strategy by index. Keywords: 回测单个, 回测某一个, 指定策略回测, backtest one, single backtest, 回测策略N
+
+[7] Live Trading + Auto Backtest — Run LLM live trading plus let the agent decide whether to trigger backtests. Keywords: 自动回测, 交易加回测, auto backtest, live plus backtest
+
+[8] Regenerate Strategy Config — Generate new random strategies in strategy_config.json. Keywords: 生成策略, 重新生成, 创建策略, generate strategies, create config, 生成配置, 新策略, 重新生成配置
+
+[9] View Alpaca Account Summary — Show current Alpaca paper account balance, positions, P&L. Keywords: 查看账户, 账户摘要, 持仓, 余额, account summary, view account, 我的账户, 账户情况, 仓位
+
+[10] LLM Rebalance Frequency Analysis — Use LLM to recommend optimal rebalance frequency. Keywords: 调仓频率, 再平衡频率, rebalance frequency, 多久调仓, 调仓周期
+
+[11] Multi-Strategy Parallel Trading — Run 2+ strategies simultaneously with capital split. Keywords: 多策略并行, 组合策略, 多个策略一起, parallel strategies, multi-strategy, 策略组合, 多策略
+
+[12] Manage TP/SL (Attach + Status Check) — Check TP/SL thresholds and attach orders. Keywords: 止盈止损, 设置止盈, 止损, TP/SL, take profit, stop loss, 盈亏管理
+
+[13] Auto-Select Best Strategy & Trade — Backtest all, rank, pick best, and trade. Keywords: 自动选最优, 最优策略, 自动选择策略, 选最好的, auto select best, best strategy, 智能选策略
+
+Rules:
+- Return the MOST SPECIFIC option(s) that match the user's intent.
+- matched_options is a list of integers (empty list [] if nothing matches at all).
+- If the user mentions "交易" or "下单" or "实盘", prefer Real Orders variants [2], [4] over dry run [1], [3].
+- If the user says only "回测" without qualifiers, default to [5] (backtest all).
+- If the user mentions a strategy number like "策略3" or "strategy 2", include [3] or [6].
+- Confidence should reflect how certain the match is (>0.8 = very clear, 0.5-0.8 = reasonable, <0.5 = uncertain).
+- If the request is too vague to determine a specific function, return multiple plausible options.
+- If the request has nothing to do with trading/backtesting/strategies, return empty list.
+
+User input: "{user_text}"
+
+Output strictly as JSON:
+{{
+    "matched_options": [<list of integers>],
+    "confidence": <float 0.0-1.0>,
+    "reasoning": "<one sentence in Chinese explaining the match>"
+}}
+"""
+
+
+def _recognize_intent(user_text: str) -> dict:
+    """Use LLM to map natural language to menu option number(s).
+
+    Returns:
+        {matched_options: [int, ...], confidence: float, reasoning: str}
+    """
+    decider = BaseAgent(name="IntentRecognizer", system_prompt=INTENT_RECOGNITION_SYSTEM)
+    prompt = INTENT_RECOGNITION_TEMPLATE.format(user_text=user_text)
+    result = decider.call_llm(prompt)
+
+    if result is None:
+        return {
+            "matched_options": [],
+            "confidence": 0.0,
+            "reasoning": "LLM unavailable — cannot recognize intent.",
+        }
+
+    opts = result.get("matched_options", [])
+    if isinstance(opts, int):
+        opts = [opts]
+    opts = [int(o) for o in opts if isinstance(o, (int, float)) and 1 <= int(o) <= 13]
+
+    return {
+        "matched_options": opts,
+        "confidence": float(result.get("confidence", 0.0)),
+        "reasoning": str(result.get("reasoning", "")),
+    }
+
+
+# Option number → (label, handler function)
+# Populated inside _interactive_loop so it has access to target_date and loop state.
+_OPTION_LABELS: dict[int, str] = {
+    1: "LLM Multi-Agent Trading (Dry Run)",
+    2: "LLM Multi-Agent Trading (Real Orders)",
+    3: "Strategy-Based Trading (Dry Run)",
+    4: "Strategy-Based Trading (Real Orders)",
+    5: "Backtest All Strategies",
+    6: "Backtest Single Strategy",
+    7: "Live Trading + Auto Backtest",
+    8: "Regenerate Strategy Config",
+    9: "View Alpaca Account Summary",
+    10: "LLM Rebalance Frequency Analysis",
+    11: "Multi-Strategy Parallel Trading",
+    12: "Manage TP/SL (Attach + Status Check)",
+    13: "Auto-Select Best Strategy & Trade",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # MAIN — unified entry point for live trading + backtesting
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -1494,6 +1903,8 @@ def _show_menu():
 ║ [10] LLM Rebalance Frequency Analysis            ║
 ║ [11] Multi-Strategy Parallel Trading             ║
 ║ [12] Manage TP/SL (Attach + Status Check)        ║
+║ [13] Auto-Select Best Strategy & Trade           ║
+║ [14] Natural Language Input (AI Intent Recognition)║
 ║  [0] Exit                                        ║
 ║                                                  ║
 ╚══════════════════════════════════════════════════╝
@@ -1553,6 +1964,313 @@ def _view_account_summary():
         print(f"  Failed to fetch account summary: {e}")
 
 
+def _execute_option(choice: str, target_date: str) -> str:
+    """Execute a single menu option. Returns 'continue', 'exit', or 'invalid'.
+
+    This function is called both from the numeric menu and from the intent
+    recognition path ([14]) so that natural-language input can dispatch to
+    the same handler code without duplication.
+    """
+    # ── [0] Exit ──────────────────────────────────────────────────
+    if choice == "0":
+        print("  Goodbye.")
+        return "exit"
+
+    # ── [1] LLM Multi-Agent (Dry Run) ──────────────────────────
+    elif choice == "1":
+        print(f"\n  ── LLM Multi-Agent Trading (Dry Run) | {target_date} ──\n")
+        agent = TradingAgent()
+        agent.run(target_date=target_date, dry_run=True)
+        agent.report()
+        return "continue"
+
+    # ── [2] LLM Multi-Agent (Real Orders) ──────────────────────
+    elif choice == "2":
+        confirm = input("  Submit REAL orders to Alpaca paper account? [y/N]: ").strip().lower()
+        if confirm != "y":
+            print("  Cancelled.")
+        else:
+            print(f"\n  ── LLM Multi-Agent Trading (Real Orders) | {target_date} ──\n")
+            agent = TradingAgent()
+            agent.run(target_date=target_date, dry_run=False)
+            agent.report()
+        return "continue"
+
+    # ── [3] Strategy-Based (Dry Run) ───────────────────────────
+    elif choice == "3":
+        strategies = _list_strategies()
+        idx = _pick_strategy(strategies)
+        if idx is None:
+            print("  Cancelled.")
+        else:
+            print(f"\n  ── Strategy-Based Trading (Dry Run) | #{idx} | {target_date} ──\n")
+            agent = TradingAgent()
+            agent.run_with_strategy(idx, target_date=target_date, dry_run=True)
+            agent.report()
+        return "continue"
+
+    # ── [4] Strategy-Based (Real Orders) ───────────────────────
+    elif choice == "4":
+        strategies = _list_strategies()
+        idx = _pick_strategy(strategies)
+        if idx is None:
+            print("  Cancelled.")
+        else:
+            confirm = input("  Submit REAL orders to Alpaca paper account? [y/N]: ").strip().lower()
+            if confirm != "y":
+                print("  Cancelled.")
+            else:
+                print(f"\n  ── Strategy-Based Trading (Real Orders) | #{idx} | {target_date} ──\n")
+                agent = TradingAgent()
+                agent.run_with_strategy(idx, target_date=target_date, dry_run=False)
+                agent.report()
+        return "continue"
+
+    # ── [5] Backtest All Strategies ────────────────────────────
+    elif choice == "5":
+        print(f"\n  ── Backtest All Strategies ──\n")
+        agent = TradingAgent()
+        agent.trigger_backtest(verbose=True)
+        return "continue"
+
+    # ── [6] Backtest Single Strategy ───────────────────────────
+    elif choice == "6":
+        strategies = _list_strategies()
+        idx = _pick_strategy(strategies)
+        if idx is None:
+            print("  Cancelled.")
+        else:
+            print(f"\n  ── Backtest Strategy [{idx}] ──\n")
+            agent = TradingAgent()
+            agent.trigger_backtest([idx], verbose=True)
+        return "continue"
+
+    # ── [7] Live Trading + Auto Backtest ───────────────────────
+    elif choice == "7":
+        print(f"\n  ── Live Trading + Auto Backtest | {target_date} ──\n")
+        agent = TradingAgent()
+        agent.run(target_date=target_date, dry_run=True)
+        agent.report()
+        print(f"\n  ── Auto Backtest Decision ──")
+        results = agent.auto_backtest(target_date)
+        if results:
+            print(f"\n  {len(results)} strategy(s) backtested.")
+        return "continue"
+
+    # ── [8] Regenerate Strategy Config ─────────────────────────
+    elif choice == "8":
+        try:
+            n = input("  Number of strategies to generate [5]: ").strip()
+            n = int(n) if n else 5
+        except (ValueError, EOFError, KeyboardInterrupt):
+            n = 5
+        print(f"\n  ── Generating {n} strategies ──\n")
+        StrategyConfig.generate_full_config(num_strategies=n)
+        print("  Done.")
+        return "continue"
+
+    # ── [9] View Alpaca Account Summary ────────────────────────
+    elif choice == "9":
+        _view_account_summary()
+        return "continue"
+
+    # ── [10] LLM Rebalance Frequency Analysis ───────────────────
+    elif choice == "10":
+        print(f"\n  ── Rebalance Frequency Analysis | {target_date} ──\n")
+        agent = TradingAgent()
+        agent.raw_data = agent.data_agent.fetch_market_data(
+            agent.tickers, BACKTEST_START, target_date
+        )
+        end_dt = pd.to_datetime(target_date)
+        hist = agent.raw_data[agent.raw_data.index < end_dt].copy()
+        print(f"  ── Macro ──")
+        agent.market_state = agent.macro_agent.assess(hist, target_date)
+        print(f"  Phase: {agent.market_state['market_phase']}  "
+              f"Appetite: {agent.market_state['risk_appetite']}/10")
+        print(f"  ── Risk ──")
+        bt_summary = agent._build_backtest_summary()
+        agent.risk_assessment = agent.risk_agent.assess(hist, agent.tickers, target_date, bt_summary)
+        print(f"  Level: {agent.risk_assessment['risk_level']}  "
+              f"Action: {agent.risk_assessment['action']}")
+        print(f"  ── Frequency Decision ──")
+        agent.decide_rebalance_frequency(target_date)
+        return "continue"
+
+    # ── [11] Multi-Strategy Parallel Trading ────────────────────
+    elif choice == "11":
+        strategies = _list_strategies()
+        if not strategies:
+            return "continue"
+        print("  ┌─────────────────────────────────────────────────┐")
+        print("  │  Multi-Strategy: select 2+ strategies to run    │")
+        print("  │  in parallel. Each gets a capital slice, then   │")
+        print("  │  their target weights are merged into one.       │")
+        print("  └─────────────────────────────────────────────────┘")
+        raw = input("  Strategy indices (comma-separated, e.g. 0,1,2): ").strip()
+        if not raw:
+            print("  Cancelled.")
+            return "continue"
+        try:
+            indices = [int(x.strip()) for x in raw.split(",") if x.strip()]
+        except ValueError:
+            print("  Invalid indices.")
+            return "continue"
+        if len(indices) < 2:
+            print("  Multi-strategy needs at least 2 strategies. Use [3] or [4] for single.")
+            return "continue"
+        # Show selected strategies and capital allocation
+        print(f"\n  ┌── Selected Strategies ({len(indices)}) ──────────────────┐")
+        for j, idx in enumerate(indices):
+            s = strategies[idx]
+            tickers = s.get('tickers', [])
+            factors = list(s.get('factors', {}).keys())
+            print(f"  │ [{j}] #{idx} {s['name']:<25} "
+                  f"{len(factors)} factors, {len(tickers)} tickers │")
+        print(f"  └{'─'*54}┘")
+        # Capital allocation
+        print(f"\n  Capital allocation (default: equal split):")
+        custom_cap = input("  Enter custom weights (e.g. 50,30,20) or press Enter for equal: ").strip()
+        if custom_cap:
+            try:
+                cap_weights = [float(x.strip()) for x in custom_cap.split(",") if x.strip()]
+                if len(cap_weights) != len(indices):
+                    print(f"  Need {len(indices)} weights, got {len(cap_weights)}. Using equal split.")
+                    cap_weights = None
+                else:
+                    total = sum(cap_weights)
+                    cap_weights = [w / total for w in cap_weights]
+            except ValueError:
+                print("  Invalid weights. Using equal split.")
+                cap_weights = None
+        else:
+            cap_weights = None
+        # Show allocation
+        print(f"\n  ┌── Capital Allocation ────────────────────────────┐")
+        for j, idx in enumerate(indices):
+            s = strategies[idx]
+            cw = cap_weights[j] if cap_weights else 1.0 / len(indices)
+            bar = "█" * int(cw * 30)
+            print(f"  │ [{j}] {s['name']:<25} {cw*100:5.1f}% {bar} │")
+        print(f"  └{'─'*54}┘")
+        # Confirm
+        print(f"\n  ── Multi-Strategy ({len(indices)} strategies) | {target_date} ──")
+        confirm = input("  Submit REAL orders to Alpaca paper account? [y/N]: ").strip().lower()
+        dry = confirm != "y"
+        use_bracket = input("  Use bracket orders with TP/SL for buys? [y/N]: ").strip().lower() == "y"
+        agent = TradingAgent()
+        agent.run_multi_strategies(indices, target_date=target_date,
+                                   dry_run=dry, use_bracket=use_bracket,
+                                   capital_weights=cap_weights)
+        return "continue"
+
+    # ── [12] Manage TP/SL (Attach + Status Check) ───────────────
+    elif choice == "12":
+        if not ALPACA_AVAILABLE:
+            print("  alpaca-py not installed.")
+        else:
+            print(f"\n  ── TP/SL Management ──")
+            tp = input(f"  Take-Profit % [{TAKE_PROFIT_PCT*100:.0f}]: ").strip()
+            sl = input(f"  Stop-Loss % [{STOP_LOSS_PCT*100:.0f}]: ").strip()
+            tp_pct = float(tp) / 100 if tp else TAKE_PROFIT_PCT
+            sl_pct = float(sl) / 100 if sl else STOP_LOSS_PCT
+            execute = input("  Submit TP/SL orders? [y/N]: ").strip().lower() == "y"
+            executor = AlpacaExecutor()
+            executor.check_tpsl_status()
+            executor.attach_tpsl_all(tp_pct=tp_pct, sl_pct=sl_pct, dry_run=not execute)
+        return "continue"
+
+    # ── [13] Auto-Select Best Strategy & Trade ──────────────────
+    elif choice == "13":
+        print(f"\n  ── Auto-Select Best Strategy & Trade | {target_date} ──\n")
+        confirm = input("  Submit REAL orders to Alpaca paper account? [y/N]: ").strip().lower()
+        dry = confirm != "y"
+        use_bracket = False
+        if not dry:
+            use_bracket = input("  Use bracket orders with TP/SL for buys? [y/N]: ").strip().lower() == "y"
+        agent = TradingAgent()
+        try:
+            agent.auto_select_and_trade(target_date=target_date,
+                                        dry_run=dry, use_bracket=use_bracket)
+        except ValueError as e:
+            print(f"  Error: {e}")
+        return "continue"
+
+    # ── [14] Natural Language Input (AI Intent Recognition) ─────
+    elif choice == "14":
+        print(f"\n  ── Natural Language Input (AI Intent Recognition) ──")
+        print("  Describe what you want to do in plain English or Chinese.")
+        try:
+            user_text = input("  Your request: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("  Cancelled.")
+            return "continue"
+        if not user_text:
+            print("  Cancelled.")
+            return "continue"
+
+        print(f"  Recognizing intent for: \"{user_text}\"")
+        intent = _recognize_intent(user_text)
+        matched = intent.get("matched_options", [])
+        confidence = intent.get("confidence", 0.0)
+        reasoning = intent.get("reasoning", "")
+
+        print(f"  Reasoning: {reasoning}")
+        print(f"  Confidence: {confidence:.2f}")
+
+        # ── Case 1: no match ──
+        if not matched:
+            print(f"\n  ✗ Unable to match any existing function.")
+            print(f"  Try a more specific description, or select an option from the menu.")
+            print(f"  Available functions:")
+            for num, label in _OPTION_LABELS.items():
+                print(f"    [{num}] {label}")
+            return "continue"
+
+        # ── Case 2: single match ──
+        if len(matched) == 1:
+            opt = matched[0]
+            label = _OPTION_LABELS.get(opt, f"Option {opt}")
+            print(f"\n  ✓ Matched: [{opt}] {label}")
+            if confidence >= 0.7:
+                confirm = input(f"  Execute this function? [Y/n]: ").strip().lower()
+                if confirm in ("n", "no"):
+                    print("  Cancelled.")
+                    return "continue"
+            else:
+                confirm = input(f"  Low confidence. Execute anyway? [y/N]: ").strip().lower()
+                if confirm != "y":
+                    print("  Cancelled.")
+                    return "continue"
+            print(f"  → Executing [{opt}] {label}\n")
+            return _execute_option(str(opt), target_date)
+
+        # ── Case 3: multiple matches ──
+        print(f"\n  ⚠ Matched {len(matched)} possible functions:")
+        for i, opt in enumerate(matched):
+            label = _OPTION_LABELS.get(opt, f"Option {opt}")
+            print(f"    [{i+1}] [{opt}] {label}")
+        print(f"    [0] Cancel")
+        try:
+            pick = input(f"  Select (1-{len(matched)}): ").strip()
+            if pick == "0" or not pick:
+                print("  Cancelled.")
+                return "continue"
+            pick_idx = int(pick) - 1
+            if 0 <= pick_idx < len(matched):
+                opt = matched[pick_idx]
+                label = _OPTION_LABELS.get(opt, f"Option {opt}")
+                print(f"  → Executing [{opt}] {label}\n")
+                return _execute_option(str(opt), target_date)
+            else:
+                print("  Invalid selection.")
+        except (ValueError, EOFError, KeyboardInterrupt):
+            print("  Cancelled.")
+        return "continue"
+
+    else:
+        return "invalid"
+
+
 def _interactive_loop():
     """Run the interactive CLI menu loop."""
     target_date = datetime.today().strftime("%Y-%m-%d")
@@ -1560,164 +2278,16 @@ def _interactive_loop():
     while True:
         _show_menu()
         try:
-            choice = input("  Select an option [0-12]: ").strip()
+            choice = input("  Select an option [0-14]: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n  Goodbye.")
             break
 
-        if choice == "0":
-            print("  Goodbye.")
+        status = _execute_option(choice, target_date)
+        if status == "exit":
             break
-
-        # ── [1] LLM Multi-Agent (Dry Run) ──────────────────────────
-        elif choice == "1":
-            print(f"\n  ── LLM Multi-Agent Trading (Dry Run) | {target_date} ──\n")
-            agent = TradingAgent()
-            agent.run(target_date=target_date, dry_run=True)
-            agent.report()
-
-        # ── [2] LLM Multi-Agent (Real Orders) ──────────────────────
-        elif choice == "2":
-            confirm = input("  Submit REAL orders to Alpaca paper account? [y/N]: ").strip().lower()
-            if confirm != "y":
-                print("  Cancelled.")
-            else:
-                print(f"\n  ── LLM Multi-Agent Trading (Real Orders) | {target_date} ──\n")
-                agent = TradingAgent()
-                agent.run(target_date=target_date, dry_run=False)
-                agent.report()
-
-        # ── [3] Strategy-Based (Dry Run) ───────────────────────────
-        elif choice == "3":
-            strategies = _list_strategies()
-            idx = _pick_strategy(strategies)
-            if idx is None:
-                print("  Cancelled.")
-            else:
-                print(f"\n  ── Strategy-Based Trading (Dry Run) | #{idx} | {target_date} ──\n")
-                agent = TradingAgent()
-                agent.run_with_strategy(idx, target_date=target_date, dry_run=True)
-                agent.report()
-
-        # ── [4] Strategy-Based (Real Orders) ───────────────────────
-        elif choice == "4":
-            strategies = _list_strategies()
-            idx = _pick_strategy(strategies)
-            if idx is None:
-                print("  Cancelled.")
-            else:
-                confirm = input("  Submit REAL orders to Alpaca paper account? [y/N]: ").strip().lower()
-                if confirm != "y":
-                    print("  Cancelled.")
-                else:
-                    print(f"\n  ── Strategy-Based Trading (Real Orders) | #{idx} | {target_date} ──\n")
-                    agent = TradingAgent()
-                    agent.run_with_strategy(idx, target_date=target_date, dry_run=False)
-                    agent.report()
-
-        # ── [5] Backtest All Strategies ────────────────────────────
-        elif choice == "5":
-            print(f"\n  ── Backtest All Strategies ──\n")
-            agent = TradingAgent()
-            agent.trigger_backtest(verbose=True)
-
-        # ── [6] Backtest Single Strategy ───────────────────────────
-        elif choice == "6":
-            strategies = _list_strategies()
-            idx = _pick_strategy(strategies)
-            if idx is None:
-                print("  Cancelled.")
-            else:
-                print(f"\n  ── Backtest Strategy [{idx}] ──\n")
-                agent = TradingAgent()
-                agent.trigger_backtest([idx], verbose=True)
-
-        # ── [7] Live Trading + Auto Backtest ───────────────────────
-        elif choice == "7":
-            print(f"\n  ── Live Trading + Auto Backtest | {target_date} ──\n")
-            agent = TradingAgent()
-            agent.run(target_date=target_date, dry_run=True)
-            agent.report()
-            print(f"\n  ── Auto Backtest Decision ──")
-            results = agent.auto_backtest(target_date)
-            if results:
-                print(f"\n  {len(results)} strategy(s) backtested.")
-
-        # ── [8] Regenerate Strategy Config ─────────────────────────
-        elif choice == "8":
-            try:
-                n = input("  Number of strategies to generate [5]: ").strip()
-                n = int(n) if n else 5
-            except (ValueError, EOFError, KeyboardInterrupt):
-                n = 5
-            print(f"\n  ── Generating {n} strategies ──\n")
-            StrategyConfig.generate_full_config(num_strategies=n)
-            print("  Done.")
-
-        # ── [9] View Alpaca Account Summary ────────────────────────
-        elif choice == "9":
-            _view_account_summary()
-
-        # ── [10] LLM Rebalance Frequency Analysis ───────────────────
-        elif choice == "10":
-            print(f"\n  ── Rebalance Frequency Analysis | {target_date} ──\n")
-            agent = TradingAgent()
-            agent.raw_data = agent.data_agent.fetch_market_data(
-                agent.tickers, BACKTEST_START, target_date
-            )
-            end_dt = pd.to_datetime(target_date)
-            hist = agent.raw_data[agent.raw_data.index < end_dt].copy()
-            print(f"  ── Macro ──")
-            agent.market_state = agent.macro_agent.assess(hist, target_date)
-            print(f"  Phase: {agent.market_state['market_phase']}  "
-                  f"Appetite: {agent.market_state['risk_appetite']}/10")
-            print(f"  ── Risk ──")
-            bt_summary = agent._build_backtest_summary()
-            agent.risk_assessment = agent.risk_agent.assess(hist, agent.tickers, target_date, bt_summary)
-            print(f"  Level: {agent.risk_assessment['risk_level']}  "
-                  f"Action: {agent.risk_assessment['action']}")
-            print(f"  ── Frequency Decision ──")
-            agent.decide_rebalance_frequency(target_date)
-
-        # ── [11] Multi-Strategy Parallel Trading ────────────────────
-        elif choice == "11":
-            strategies = _list_strategies()
-            if not strategies:
-                continue
-            raw = input("  Strategy indices (comma-separated, e.g. 0,1,2): ").strip()
-            if not raw:
-                print("  Cancelled.")
-            else:
-                try:
-                    indices = [int(x.strip()) for x in raw.split(",") if x.strip()]
-                except ValueError:
-                    print("  Invalid indices.")
-                    continue
-                print(f"\n  ── Multi-Strategy Trading ({len(indices)} strategies) | {target_date} ──")
-                confirm = input("  Submit REAL orders to Alpaca paper account? [y/N]: ").strip().lower()
-                dry = confirm != "y"
-                use_bracket = input("  Use bracket orders with TP/SL for buys? [y/N]: ").strip().lower() == "y"
-                agent = TradingAgent()
-                agent.run_multi_strategies(indices, target_date=target_date,
-                                           dry_run=dry, use_bracket=use_bracket)
-
-        # ── [12] Manage TP/SL (Attach + Status Check) ───────────────
-        elif choice == "12":
-            if not ALPACA_AVAILABLE:
-                print("  alpaca-py not installed.")
-            else:
-                print(f"\n  ── TP/SL Management ──")
-                tp = input(f"  Take-Profit % [{TAKE_PROFIT_PCT*100:.0f}]: ").strip()
-                sl = input(f"  Stop-Loss % [{STOP_LOSS_PCT*100:.0f}]: ").strip()
-                tp_pct = float(tp) / 100 if tp else TAKE_PROFIT_PCT
-                sl_pct = float(sl) / 100 if sl else STOP_LOSS_PCT
-                execute = input("  Submit TP/SL orders? [y/N]: ").strip().lower() == "y"
-                executor = AlpacaExecutor()
-                executor.check_tpsl_status()
-                executor.attach_tpsl_all(tp_pct=tp_pct, sl_pct=sl_pct, dry_run=not execute)
-
-        else:
-            print(f"  Invalid option. Choose 0-12.")
+        elif status == "invalid":
+            print(f"  Invalid option. Choose 0-14.")
 
 
 if __name__ == "__main__":
@@ -1740,6 +2310,8 @@ Examples:
   python Paper_Trading_Agent.py --backtest                         # backtest all strategies
   python Paper_Trading_Agent.py --backtest --strategy 0            # backtest strategy #0 only
   python Paper_Trading_Agent.py --auto-backtest                    # LLM live + agent decides backtest
+  python Paper_Trading_Agent.py --auto-select                      # backtest all, select best, dry run trade
+  python Paper_Trading_Agent.py --auto-select --live               # backtest all, select best, real orders
   python Paper_Trading_Agent.py --generate-config                   # regenerate strategy_config.json
   python Paper_Trading_Agent.py --generate-config --strategies 8
   python Paper_Trading_Agent.py --summary                          # view Alpaca account summary
@@ -1767,6 +2339,8 @@ Examples:
     parser.add_argument("--use-strategy", type=int, default=None,
                         help="Use strategy_config.json[N] as the trading rules "
                              "(bypasses LLM, uses 24-factor rule engine)")
+    parser.add_argument("--auto-select", action="store_true",
+                        help="Backtest all strategies, auto-select the best, and paper trade")
     parser.add_argument("--strategies", type=int, default=5,
                         help="Number of strategies when generating config")
     parser.add_argument("--tickers", type=str, default=None,
@@ -1830,6 +2404,17 @@ Examples:
     # ── Live-only mode (default) ────────────────────────────────────────
     dry_run = not args.live
     use_strat = args.use_strategy
+    auto_select = args.auto_select
+
+    # ── Auto-select best strategy branch ────────────────────────────────
+    if auto_select:
+        mode_label = "AUTO-SELECT BEST STRATEGY"
+        order_label = "real orders" if not dry_run else "dry run"
+        print(f"\n{'='*60}")
+        print(f"  LIVE TRADING — {mode_label} ({order_label})")
+        print(f"{'='*60}")
+        agent.auto_select_and_trade(target_date=target_date, dry_run=dry_run)
+        sys.exit(0)
 
     if use_strat is not None:
         mode_label = f"STRATEGY #{use_strat} RULE-BASED"
