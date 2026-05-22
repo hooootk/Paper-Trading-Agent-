@@ -1,0 +1,442 @@
+{
+  "strategies": [
+    {
+      "name": "strategy_1",
+      "start_date": "2021-01-01",
+      "end_date": "2023-06-30",
+      "tickers": [
+        "ABBV",
+        "JPM",
+        "MA",
+        "NVDA",
+        "AMD",
+        "AVGO",
+        "MSFT",
+        "META",
+        "BAC",
+        "PFE",
+        "COST",
+        "KO",
+        "TXN"
+      ],
+      "initial_capital": 100000,
+      "signal_logic": "majority_vote",
+      "rebalance_frequency": "biweekly",
+      "position_sizing": "equal_weight",
+      "max_positions": 5,
+      "factors": {
+        "williams_r_14": {
+          "weight": 0.87,
+          "direction": 1,
+          "threshold_long": 0.34,
+          "threshold_short": -0.36
+        },
+        "bollinger_squeeze": {
+          "weight": 1.07,
+          "direction": 1,
+          "threshold_long": 0.28,
+          "threshold_short": -0.32
+        },
+        "atr_14": {
+          "weight": 1.45,
+          "direction": 1,
+          "threshold_long": 0.29,
+          "threshold_short": -0.4
+        },
+        "ema_crossover_12_26": {
+          "weight": 1.31,
+          "direction": 1,
+          "threshold_long": 0.47,
+          "threshold_short": -0.26
+        },
+        "volume_ratio": {
+          "weight": 0.56,
+          "direction": 1,
+          "threshold_long": 0.12,
+          "threshold_short": -0.11
+        },
+        "sma_crossover_50_200": {
+          "weight": 0.54,
+          "direction": 1,
+          "threshold_long": 0.31,
+          "threshold_short": -0.31
+        },
+        "rsi_14": {
+          "weight": 0.65,
+          "direction": -1,
+          "threshold_long": 0.12,
+          "threshold_short": -0.39
+        },
+        "beta_spy": {
+          "weight": 1.05,
+          "direction": -1,
+          "threshold_long": 0.31,
+          "threshold_short": -0.28
+        },
+        "volatility_regime": {
+          "weight": 0.38,
+          "direction": -1,
+          "threshold_long": 0.18,
+          "threshold_short": -0.12
+        },
+        "sma_crossover_20_50": {
+          "weight": 1.44,
+          "direction": -1,
+          "threshold_long": 0.13,
+          "threshold_short": -0.16
+        }
+      }
+    },
+    {
+      "name": "strategy_2",
+      "start_date": "2022-01-01",
+      "end_date": "2025-01-01",
+      "tickers": [
+        "JPM",
+        "CSCO",
+        "COST",
+        "ADBE",
+        "PEP",
+        "GOOGL",
+        "HD",
+        "AMD",
+        "XOM",
+        "DIS"
+      ],
+      "initial_capital": 200000,
+      "signal_logic": "top_n",
+      "rebalance_frequency": "daily",
+      "position_sizing": "factor_score",
+      "max_positions": 10,
+      "factors": {
+        "momentum_20d": {
+          "weight": 1.31,
+          "direction": 1,
+          "threshold_long": 0.25,
+          "threshold_short": -0.49
+        },
+        "macd_histogram": {
+          "weight": 0.91,
+          "direction": -1,
+          "threshold_long": 0.16,
+          "threshold_short": -0.38
+        },
+        "bollinger_squeeze": {
+          "weight": 0.97,
+          "direction": 1,
+          "threshold_long": 0.45,
+          "threshold_short": -0.41
+        },
+        "return_5d_reversal": {
+          "weight": 0.91,
+          "direction": 1,
+          "threshold_long": 0.34,
+          "threshold_short": -0.4
+        },
+        "momentum_120d": {
+          "weight": 1.45,
+          "direction": -1,
+          "threshold_long": 0.17,
+          "threshold_short": -0.42
+        },
+        "stochastic_14": {
+          "weight": 1.5,
+          "direction": 1,
+          "threshold_long": 0.41,
+          "threshold_short": -0.49
+        },
+        "macd_signal": {
+          "weight": 1.12,
+          "direction": 1,
+          "threshold_long": 0.5,
+          "threshold_short": -0.21
+        },
+        "williams_r_14": {
+          "weight": 1.22,
+          "direction": 1,
+          "threshold_long": 0.31,
+          "threshold_short": -0.42
+        },
+        "adx_14": {
+          "weight": 0.39,
+          "direction": 1,
+          "threshold_long": 0.16,
+          "threshold_short": -0.23
+        },
+        "volume_price_trend": {
+          "weight": 1.49,
+          "direction": -1,
+          "threshold_long": 0.45,
+          "threshold_short": -0.45
+        },
+        "drawdown_60d": {
+          "weight": 0.34,
+          "direction": 1,
+          "threshold_long": 0.3,
+          "threshold_short": -0.41
+        }
+      }
+    },
+    {
+      "name": "strategy_3",
+      "start_date": "2020-06-01",
+      "end_date": "2024-06-01",
+      "tickers": [
+        "TXN",
+        "JNJ",
+        "V",
+        "AAPL",
+        "UNH",
+        "META",
+        "XOM",
+        "QCOM",
+        "PFE",
+        "MSFT",
+        "BAC",
+        "CRM"
+      ],
+      "initial_capital": 200000,
+      "signal_logic": "majority_vote",
+      "rebalance_frequency": "monthly",
+      "position_sizing": "equal_weight",
+      "max_positions": 10,
+      "factors": {
+        "return_5d_reversal": {
+          "weight": 0.74,
+          "direction": 1,
+          "threshold_long": 0.28,
+          "threshold_short": -0.36
+        },
+        "cci_20": {
+          "weight": 1.0,
+          "direction": -1,
+          "threshold_long": 0.16,
+          "threshold_short": -0.27
+        },
+        "momentum_20d": {
+          "weight": 1.39,
+          "direction": -1,
+          "threshold_long": 0.31,
+          "threshold_short": -0.3
+        },
+        "bollinger_position": {
+          "weight": 0.83,
+          "direction": -1,
+          "threshold_long": 0.21,
+          "threshold_short": -0.32
+        },
+        "macd_signal": {
+          "weight": 0.58,
+          "direction": 1,
+          "threshold_long": 0.36,
+          "threshold_short": -0.47
+        },
+        "ema_crossover_12_26": {
+          "weight": 0.74,
+          "direction": -1,
+          "threshold_long": 0.31,
+          "threshold_short": -0.14
+        },
+        "volatility_20d": {
+          "weight": 1.37,
+          "direction": -1,
+          "threshold_long": 0.26,
+          "threshold_short": -0.29
+        },
+        "momentum_60d": {
+          "weight": 0.98,
+          "direction": -1,
+          "threshold_long": 0.39,
+          "threshold_short": -0.4
+        },
+        "rsi_14": {
+          "weight": 0.59,
+          "direction": 1,
+          "threshold_long": 0.36,
+          "threshold_short": -0.12
+        }
+      }
+    },
+    {
+      "name": "strategy_4",
+      "start_date": "2019-01-01",
+      "end_date": "2023-12-31",
+      "tickers": [
+        "CRM",
+        "BAC",
+        "PEP",
+        "XOM",
+        "AMD",
+        "HD",
+        "AMZN",
+        "TXN",
+        "WMT",
+        "ADBE",
+        "AAPL",
+        "ABBV",
+        "INTC",
+        "JPM"
+      ],
+      "initial_capital": 200000,
+      "signal_logic": "majority_vote",
+      "rebalance_frequency": "daily",
+      "position_sizing": "factor_score",
+      "max_positions": 10,
+      "factors": {
+        "ema_crossover_12_26": {
+          "weight": 1.05,
+          "direction": -1,
+          "threshold_long": 0.43,
+          "threshold_short": -0.44
+        },
+        "momentum_60d": {
+          "weight": 1.28,
+          "direction": 1,
+          "threshold_long": 0.4,
+          "threshold_short": -0.23
+        },
+        "stochastic_14": {
+          "weight": 0.71,
+          "direction": 1,
+          "threshold_long": 0.44,
+          "threshold_short": -0.44
+        },
+        "williams_r_14": {
+          "weight": 0.59,
+          "direction": 1,
+          "threshold_long": 0.46,
+          "threshold_short": -0.11
+        },
+        "macd_signal": {
+          "weight": 0.64,
+          "direction": 1,
+          "threshold_long": 0.46,
+          "threshold_short": -0.13
+        },
+        "volume_ratio": {
+          "weight": 0.55,
+          "direction": 1,
+          "threshold_long": 0.25,
+          "threshold_short": -0.3
+        },
+        "adx_14": {
+          "weight": 0.5,
+          "direction": 1,
+          "threshold_long": 0.4,
+          "threshold_short": -0.31
+        },
+        "volatility_regime": {
+          "weight": 1.23,
+          "direction": -1,
+          "threshold_long": 0.35,
+          "threshold_short": -0.3
+        },
+        "momentum_20d": {
+          "weight": 0.82,
+          "direction": -1,
+          "threshold_long": 0.33,
+          "threshold_short": -0.4
+        },
+        "sma_crossover_20_50": {
+          "weight": 0.94,
+          "direction": -1,
+          "threshold_long": 0.44,
+          "threshold_short": -0.17
+        },
+        "volatility_20d": {
+          "weight": 0.77,
+          "direction": 1,
+          "threshold_long": 0.34,
+          "threshold_short": -0.36
+        }
+      }
+    },
+    {
+      "name": "strategy_5",
+      "start_date": "2021-06-01",
+      "end_date": "2024-12-31",
+      "tickers": [
+        "BAC",
+        "JPM",
+        "HD",
+        "TXN",
+        "XOM",
+        "QCOM",
+        "CSCO"
+      ],
+      "initial_capital": 50000,
+      "signal_logic": "weighted_sum",
+      "rebalance_frequency": "daily",
+      "position_sizing": "factor_score",
+      "max_positions": 5,
+      "factors": {
+        "ema_crossover_12_26": {
+          "weight": 0.77,
+          "direction": -1,
+          "threshold_long": 0.38,
+          "threshold_short": -0.14
+        },
+        "beta_spy": {
+          "weight": 0.83,
+          "direction": -1,
+          "threshold_long": 0.35,
+          "threshold_short": -0.24
+        },
+        "sma_crossover_50_200": {
+          "weight": 1.21,
+          "direction": -1,
+          "threshold_long": 0.38,
+          "threshold_short": -0.4
+        },
+        "atr_14": {
+          "weight": 0.93,
+          "direction": 1,
+          "threshold_long": 0.4,
+          "threshold_short": -0.44
+        },
+        "momentum_60d": {
+          "weight": 0.72,
+          "direction": 1,
+          "threshold_long": 0.15,
+          "threshold_short": -0.23
+        },
+        "bollinger_position": {
+          "weight": 0.46,
+          "direction": 1,
+          "threshold_long": 0.25,
+          "threshold_short": -0.41
+        },
+        "obv_trend": {
+          "weight": 0.98,
+          "direction": -1,
+          "threshold_long": 0.37,
+          "threshold_short": -0.31
+        },
+        "momentum_20d": {
+          "weight": 0.53,
+          "direction": -1,
+          "threshold_long": 0.21,
+          "threshold_short": -0.33
+        },
+        "momentum_120d": {
+          "weight": 1.15,
+          "direction": -1,
+          "threshold_long": 0.29,
+          "threshold_short": -0.35
+        },
+        "sma_crossover_20_50": {
+          "weight": 1.12,
+          "direction": 1,
+          "threshold_long": 0.3,
+          "threshold_short": -0.1
+        },
+        "stochastic_14": {
+          "weight": 0.89,
+          "direction": 1,
+          "threshold_long": 0.39,
+          "threshold_short": -0.34
+        }
+      }
+    }
+  ]
+}
