@@ -1,5 +1,19 @@
 # Paper Trading Agent
 
+## 目录
+
+- [一、LLM 多智能体交易引擎](#一llm-多智能体交易引擎)
+- [二、24 因子规则化回测引擎](#二24-因子规则化回测引擎)
+- [三、止盈止损](#三止盈止损)
+- [四、多策略并行](#四多策略并行)
+- [五、双引擎对比](#五双引擎对比)
+- [六、交互方式](#六交互方式)
+- [七、技术栈](#七技术栈)
+- [八、默认投资组合](#八默认投资组合)
+- [九、使用方法](#九使用方法)
+
+---
+
 ## 概述
 
 Paper Trading Agent 是一个 **LLM + 规则双引擎量化模拟交易系统**，支持美股多策略交易与回测。系统由两个核心模块构成：
@@ -200,3 +214,135 @@ python Paper_Trading_Agent.py --summary           # 查看账户
 **Paper_Trading_Agent**：AAPL、MSFT、JPM、JNJ、XOM、AMZN、NVDA、UNH、BAC、PG
 
 **BacktestEngine 策略池**：上述 10 只 + GOOGL、META、TSLA、V、MA、HD、DIS、NFLX、ADBE、CRM、AMD、INTC、PFE、WMT、KO、PEP、CSCO、QCOM、TXN、AVGO、COST、ABBV（共 32 只）
+
+---
+
+## 九、使用方法
+
+### 1. 直接启动（交互式菜单）
+
+```bash
+python Paper_Trading_Agent.py
+```
+
+无任何参数启动，进入交互式菜单，显示 13 个功能选项。输入数字选择要执行的操作，每次执行完毕后菜单重新显示，输入 `0` 退出。
+
+### 2. LLM 多智能体交易
+
+```bash
+# 模拟交易（分析 + 显示计划调仓，不实际下单）
+python Paper_Trading_Agent.py
+
+# 实盘交易（分析 + 提交真实 Alpaca 纸交易订单）
+python Paper_Trading_Agent.py --live
+
+# 指定日期执行
+python Paper_Trading_Agent.py --live --date 2026-05-20
+
+# 自定义标的
+python Paper_Trading_Agent.py --live --tickers AAPL,TSLA,NVDA,META,GOOGL
+```
+
+### 3. 规则化策略交易
+
+```bash
+# 使用策略 #2 模拟交易（不实际下单）
+python Paper_Trading_Agent.py --use-strategy 2
+
+# 使用策略 #0 实盘交易
+python Paper_Trading_Agent.py --live --use-strategy 0
+
+# 结合自定义标的和日期
+python Paper_Trading_Agent.py --live --use-strategy 1 --tickers AAPL,MSFT,GOOGL --date 2026-05-20
+```
+
+### 4. 回测
+
+```bash
+# 回测所有策略
+python Paper_Trading_Agent.py --backtest
+
+# 回测单个策略（按索引，0-based）
+python Paper_Trading_Agent.py --backtest --strategy 0
+
+# 静默模式（减少输出）
+python Paper_Trading_Agent.py --backtest --strategy 2 --quiet
+```
+
+### 5. 自动回测模式
+
+```bash
+# 先运行 LLM 交易，再让 LLM 自动判断是否需要回测
+python Paper_Trading_Agent.py --auto-backtest
+
+# 结合策略交易 + 自动回测
+python Paper_Trading_Agent.py --auto-backtest --use-strategy 1
+```
+
+### 6. 策略配置管理
+
+```bash
+# 生成默认 5 套策略
+python Paper_Trading_Agent.py --generate-config
+
+# 生成 10 套策略
+python Paper_Trading_Agent.py --generate-config --strategies 10
+```
+
+### 7. 账户查看
+
+```bash
+# 查看 Alpaca 纸交易账户摘要
+python Paper_Trading_Agent.py --summary
+```
+
+### 8. 全部命令行参数一览
+
+| 参数 | 说明 |
+|------|------|
+| `--live` | 提交真实 Alpaca 纸交易订单（不加则为模拟运行） |
+| `--dry-run` | 显式指定模拟运行（默认行为） |
+| `--backtest` | 仅运行回测，不执行交易 |
+| `--auto-backtest` | 先执行交易，再由 LLM 判断是否需要回测 |
+| `--generate-config` | 重新生成 strategy_config.json |
+| `--summary` | 查看 Alpaca 账户摘要并退出 |
+| `--use-strategy N` | 使用策略配置中第 N 个策略（0-based），绕过 LLM，纯规则信号 |
+| `--strategy N` | 配合 `--backtest`，只回测第 N 个策略 |
+| `--strategies N` | 配合 `--generate-config`，生成 N 套策略（默认 5） |
+| `--tickers A,B,C` | 自定义交易标的（逗号分隔，覆盖默认组合） |
+| `--date YYYY-MM-DD` | 指定交易日（默认当天） |
+| `--quiet` | 减少控制台输出 |
+
+### 9. 典型工作流
+
+**场景一：验证策略思路**
+
+```bash
+# 1. 生成策略配置
+python Paper_Trading_Agent.py --generate-config --strategies 10
+
+# 2. 回测所有策略，对比绩效
+python Paper_Trading_Agent.py --backtest
+
+# 3. 选最优策略做模拟交易验证
+python Paper_Trading_Agent.py --use-strategy 3
+```
+
+**场景二：日常交易**
+
+```bash
+# 1. 启动交互菜单，选 [9] 查看账户
+# 2. 选 [10] 让 LLM 分析当前应该用多高的调仓频率
+# 3. 选 [1] 或 [3] 做模拟交易，检查信号是否合理
+# 4. 选 [2] 或 [4] 执行实盘交易
+# 5. 选 [12] 为持仓挂上止盈止损单
+```
+
+**场景三：多策略实盘部署**
+
+```bash
+# 交互菜单中选 [11]，输入策略编号如 0,1,3
+# 选择 Real Orders
+# 选择启用 Bracket TP/SL
+# 三个策略的资金等比例分配，权重合并后统一调仓
+```
